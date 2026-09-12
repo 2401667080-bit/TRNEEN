@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>مسار الصوت</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Amiri:wght@400;700&family=Cairo:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="tf.min.js"></script>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="page">
+  <header>
+    <h1>مَسار الصوت</h1>
+    <p>ارفع تلاوة، شاهد مسارها اللحني على طريقة رسم المشايخ، ثم سجّل صوتك وقلّده</p>
+    <div class="engine-badge" id="engineBadge">جارٍ التحقق من محرك التحليل...</div>
+  </header>
+  <div class="divider"></div>
+
+  <label class="field-label">نص الآية (الصقه لعرض الكلمات تحت المسار والنقر للتنقل)</label>
+  <textarea id="verse" placeholder="الصقه هنا..."></textarea>
+
+  <div class="readout" id="readout"><span class="placeholder">لا يوجد التقاط صوت بعد</span></div>
+
+  <div class="graph-wrap">
+    <div class="legend">
+      <span><i class="dot black"></i> القارئ الأصلي</span>
+      <span><i class="dot red"></i> صوتك</span>
+    </div>
+    <canvas id="curve"></canvas>
+    <div class="word-row" id="wordRow"></div>
+    <p class="align-note" id="alignNote" style="display:none;">محاذاة تقريبية للنص حسب السكتات الصوتية — وليست تفريغاً صوتياً دقيقاً. انقر أي كلمة للانتقال إليها</p>
+
+    <div class="glyph-key" id="glyphKey">
+      <span><svg width="26" height="14"><line x1="1" y1="7" x2="25" y2="7" stroke="#1E1B16" stroke-width="2"/></svg> مستقيم</span>
+      <span><svg width="26" height="14"><line x1="1" y1="12" x2="25" y2="2" stroke="#1E1B16" stroke-width="2"/></svg> صعود (جواب)</span>
+      <span><svg width="26" height="14"><line x1="1" y1="2" x2="25" y2="12" stroke="#1E1B16" stroke-width="2"/></svg> هبوط (قرار)</span>
+      <span><svg width="26" height="14"><polyline points="1,7 6,3 10,11 14,3 18,11 22,3 25,7" stroke="#1E1B16" stroke-width="1.6" fill="none"/></svg> تعرّج/عربة</span>
+      <span><svg width="26" height="14"><path d="M1,11 Q13,-3 25,11" stroke="#1E1B16" stroke-width="1.8" fill="none"/></svg> اغتراف</span>
+    </div>
+
+    <div class="sensitivity-row" id="sensitivityRow">
+      <label for="sensitivitySlider">حساسية كشف الزخارف</label>
+      <input type="range" id="sensitivitySlider" min="0" max="100" value="50">
+      <span id="sensitivityValue">متوسطة</span>
+    </div>
+
+    <div class="view-toggle">
+      <button id="modeTraditional" class="active">الرسم التقليدي</button><button id="modePrecise">العرض الدقيق (تقني)</button>
+    </div>
+  </div>
+
+  <div class="controls">
+    <input type="file" id="fileInput" accept="audio/*">
+    <button class="action" id="uploadBtn">رفع مقطع صوتي</button>
+    <button class="action" id="playBtn" disabled>تشغيل من البداية</button>
+    <button class="action" id="pauseBtn" disabled>إيقاف مؤقت</button>
+    <button class="action" id="resumeBtn" disabled>استكمال</button>
+    <button class="action record" id="recordBtn" disabled>تسجيل صوتك</button>
+    <button class="action" id="resetBtn">مسح</button>
+  </div>
+
+  <div class="status" id="status">ابدأ برفع تلاوة لرسم مسارها الصوتي</div>
+  <div class="score" id="score"></div>
+
+  <footer>نموذج أولي — يعمل بالكامل داخل المتصفح، لا يُرسل أي صوت لأي خادم</footer>
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>
