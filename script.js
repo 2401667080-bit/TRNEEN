@@ -828,7 +828,7 @@
   // below to your GitHub Release download URL, and host the small files
   // (ort.min.js, vocab.json, added_tokens.json) under ./whisper-model/.
   // ==================================================================
-  const WHISPER_RELEASE_BASE = 'https://github.com/YOUR_USERNAME/YOUR_REPO/releases/download/YOUR_TAG';
+  const WHISPER_RELEASE_BASE = 'https://github.com/2401667080-bit/TRNEEN/releases/download/v1';
   const WHISPER_LOCAL_BASE = './whisper-model/';
   const WHISPER_N_MELS = 80, WHISPER_N_FFT = 400, WHISPER_HOP = 160, WHISPER_SR = 16000;
   const WHISPER_CHUNK_SAMPLES = 30 * WHISPER_SR; // 30s fixed chunk
