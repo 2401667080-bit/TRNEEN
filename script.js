@@ -910,10 +910,12 @@
 
   async function ensureOrt(){
     if (typeof ort === 'undefined') throw new Error('مكتبة onnxruntime-web (ort.min.js) لم تُحمَّل — تأكد من إضافتها في index.html');
-    // Deliberately NOT setting ort.env.wasm.wasmPaths here: onnxruntime-web
-    // auto-detects the correct base path from where ort.min.js itself was
-    // loaded from. Setting it manually to the same relative folder caused
-    // the path to be applied twice (whisper-model/whisper-model/...).
+    // Auto-detection inside ort.min.js was producing a duplicated path
+    // (whisper-model/whisper-model/...), so the base is computed here
+    // explicitly as an absolute URL from the page's own location instead.
+    const wasmBase = new URL(WHISPER_LOCAL_BASE, document.baseURI).href;
+    ort.env.wasm.wasmPaths = wasmBase;
+    log('wasm base path set to:', wasmBase);
     ort.env.wasm.numThreads = 1; // avoid requiring cross-origin-isolation headers
   }
   async function getEncoderSession(){
