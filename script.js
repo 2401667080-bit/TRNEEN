@@ -20,6 +20,7 @@
   const engineBadge = document.getElementById('engineBadge');
   const sensitivitySlider = document.getElementById('sensitivitySlider');
   const sensitivityValue = document.getElementById('sensitivityValue');
+  const transcribeBtn = document.getElementById('transcribeBtn');
 
   let viewMode = 'traditional';
   let audioCtx = null;
@@ -311,6 +312,7 @@
     render();
     statusEl.textContent = 'تم رسم المسار الصوتي — استمع للأصل أو سجّل صوتك';
     playBtn.disabled=false; recordBtn.disabled=false;
+    if (transcribeBtn) transcribeBtn.disabled=false;
   }
 
   // ---------- Shared geometry ----------
@@ -542,8 +544,26 @@
     }
   }
 
-  // ---------- Word alignment (heuristic — not real speech recognition) ----------
+  // ---------- Word alignment ----------
+  // If Whisper produced real timestamped segments, distribute each
+  // segment's words evenly WITHIN that segment's real time span (already
+  // far more accurate than guessing across the whole file). Otherwise
+  // fall back to the old whole-file heuristic for manually pasted text.
   function computeWordAlignment(){
+    if (whisperSegments && whisperSegments.length){
+      const result = [];
+      for (const seg of whisperSegments){
+        const words = seg.text.trim().split(/\s+/).filter(Boolean);
+        if (!words.length) continue;
+        const span = Math.max(0.05, seg.tEnd - seg.tStart);
+        words.forEach((w,i) => {
+          result.push({ word:w, tStart: seg.tStart+span*i/words.length, tEnd: seg.tStart+span*(i+1)/words.length });
+        });
+      }
+      alignedWords = result;
+      renderWordRow(referenceDuration||3);
+      return;
+    }
     const text = verseTextarea.value.trim();
     if (!text || !referenceCurve){ alignedWords=[]; renderWordRow(referenceDuration||3); return; }
     const words = text.split(/\s+/).filter(Boolean);
@@ -572,7 +592,10 @@
     alignedWords = result;
     renderWordRow(referenceDuration||3);
   }
-  verseTextarea.addEventListener('input', () => { if (referenceCurve) computeWordAlignment(); });
+  verseTextarea.addEventListener('input', () => {
+    if (whisperSegments){ whisperSegments = null; } // manual edit overrides AI transcript
+    if (referenceCurve) computeWordAlignment();
+  });
 
   function renderWordRow(duration){
     wordRow.innerHTML = '';
@@ -782,14 +805,343 @@
     referenceCurve=null; referenceDuration=0; referenceAudioBuffer=null;
     liveCurve=[]; isRecording=false; playing=false; isPaused=false; playbackOffset=0; playheadTime=null;
     displayMin=55; displayMax=79; alignedWords=[]; refPiecesCache=null; livePiecesCache=null;
+    whisperSegments=null;
     playBtn.disabled=true; recordBtn.disabled=true; pauseBtn.disabled=true; resumeBtn.disabled=true;
     recordBtn.textContent='تسجيل صوتك'; recordBtn.classList.remove('active');
     scoreEl.textContent=''; verseTextarea.value='';
     statusEl.textContent='ابدأ برفع تلاوة لرسم مسارها الصوتي';
     updateReadout(null,null);
     fileInput.value=''; wordRow.innerHTML=''; alignNote.style.display='none';
+    if (transcribeBtn){ transcribeBtn.disabled = true; transcribeBtn.textContent = 'تفريغ النص تلقائياً'; }
     render();
   });
+
+  // ==================================================================
+  // Whisper ASR (Quran-tuned, tiny) — real speech-to-text, run entirely
+  // client-side via onnxruntime-web. This is the most complex, least
+  // testable piece of the app: exact ONNX input/output tensor names are
+  // introspected at runtime rather than hardcoded (since they weren't
+  // verifiable without a live browser), and everything is logged to the
+  // console with a "[Whisper]" prefix for debugging.
+  //
+  // SETUP REQUIRED (see chat instructions): edit WHISPER_RELEASE_BASE
+  // below to your GitHub Release download URL, and host the small files
+  // (ort.min.js, vocab.json, added_tokens.json) under ./whisper-model/.
+  // ==================================================================
+  const WHISPER_RELEASE_BASE = 'https://github.com/YOUR_USERNAME/YOUR_REPO/releases/download/YOUR_TAG';
+  const WHISPER_LOCAL_BASE = './whisper-model/';
+  const WHISPER_N_MELS = 80, WHISPER_N_FFT = 400, WHISPER_HOP = 160, WHISPER_SR = 16000;
+  const WHISPER_CHUNK_SAMPLES = 30 * WHISPER_SR; // 30s fixed chunk
+  const WHISPER_N_HEADS = 6, WHISPER_HEAD_DIM = 64; // whisper-tiny architecture
+
+  let whisperSegments = null; // [{text, tStart, tEnd}] once transcription completes
+  let whisperVocabPromise = null;
+  let whisperEncoderPromise = null;
+  let whisperDecoderPromise = null;
+
+  function log(...args){ console.log('[Whisper]', ...args); }
+
+  async function loadWhisperVocab(){
+    if (!whisperVocabPromise){
+      whisperVocabPromise = (async () => {
+        const [vocabRes, addedRes] = await Promise.all([
+          fetch(WHISPER_LOCAL_BASE + 'vocab.json'),
+          fetch(WHISPER_LOCAL_BASE + 'added_tokens.json')
+        ]);
+        if (!vocabRes.ok || !addedRes.ok) throw new Error('تعذّر تحميل ملفات vocab.json/added_tokens.json من ' + WHISPER_LOCAL_BASE);
+        const vocab = await vocabRes.json();       // { tokenString: id }
+        const added = await addedRes.json();        // { tokenString: id }
+        const id2tok = {};
+        for (const k in vocab) id2tok[vocab[k]] = k;
+        for (const k in added) id2tok[added[k]] = k;
+
+        // Standard GPT-2/Whisper byte<->unicode mapping (published algorithm,
+        // identical across all BPE tokenizers of this family).
+        const bs = [];
+        for (let i=33;i<=126;i++) bs.push(i);
+        for (let i=161;i<=172;i++) bs.push(i);
+        for (let i=174;i<=255;i++) bs.push(i);
+        const cs = bs.slice();
+        let n=0;
+        for (let b=0; b<256; b++){
+          if (!bs.includes(b)){ bs.push(b); cs.push(256+n); n++; }
+        }
+        const unicodeToByte = {};
+        for (let i=0;i<bs.length;i++) unicodeToByte[cs[i]] = bs[i];
+
+        function findId(tokStr){
+          if (added[tokStr] !== undefined) return added[tokStr];
+          if (vocab[tokStr] !== undefined) return vocab[tokStr];
+          return null;
+        }
+        const bosId = findId('<|startoftranscript|>');
+        const transcribeId = findId('<|transcribe|>');
+        const eotId = findId('<|endoftext|>');
+        const arId = findId('<|ar|>');
+        if (bosId===null || transcribeId===null || eotId===null || arId===null){
+          throw new Error('لم أجد رموزاً خاصة متوقعة (startoftranscript/transcribe/endoftext/ar) في ملفات القاموس.');
+        }
+        const timestampIdToTime = {};
+        const tsRegex = /^<\|(\d+(?:\.\d+)?)\|>$/;
+        for (const k in added){
+          const m = k.match(tsRegex);
+          if (m) timestampIdToTime[added[k]] = parseFloat(m[1]);
+        }
+        log('vocab loaded:', Object.keys(id2tok).length, 'tokens,', Object.keys(timestampIdToTime).length, 'timestamp tokens');
+        return { id2tok, unicodeToByte, bosId, transcribeId, eotId, arId, timestampIdToTime };
+      })();
+    }
+    return whisperVocabPromise;
+  }
+
+  function decodeTokenIds(ids, vocabData){
+    let byteStr = '';
+    for (const id of ids){
+      const tok = vocabData.id2tok[id];
+      if (tok === undefined || tok.startsWith('<|')) continue; // skip special/timestamp tokens
+      for (const ch of tok){
+        const cp = ch.codePointAt(0);
+        byteStr += String.fromCharCode(vocabData.unicodeToByte.hasOwnProperty(cp) ? vocabData.unicodeToByte[cp] : cp);
+      }
+    }
+    const bytes = new Uint8Array(byteStr.length);
+    for (let i=0;i<byteStr.length;i++) bytes[i] = byteStr.charCodeAt(i) & 0xFF;
+    return new TextDecoder('utf-8').decode(bytes);
+  }
+
+  async function ensureOrt(){
+    if (typeof ort === 'undefined') throw new Error('مكتبة onnxruntime-web (ort.min.js) لم تُحمَّل — تأكد من إضافتها في index.html');
+    ort.env.wasm.wasmPaths = WHISPER_RELEASE_BASE + '/';
+    ort.env.wasm.numThreads = 1; // avoid requiring cross-origin-isolation headers
+  }
+  async function getEncoderSession(){
+    if (!whisperEncoderPromise){
+      whisperEncoderPromise = (async () => {
+        await ensureOrt();
+        log('loading encoder session...');
+        const url = WHISPER_RELEASE_BASE + '/encoder_model_quantized.onnx';
+        const sess = await ort.InferenceSession.create(url, { executionProviders: ['wasm'] });
+        log('encoder inputs:', sess.inputNames, 'outputs:', sess.outputNames);
+        return sess;
+      })();
+    }
+    return whisperEncoderPromise;
+  }
+  async function getDecoderSession(){
+    if (!whisperDecoderPromise){
+      whisperDecoderPromise = (async () => {
+        await ensureOrt();
+        log('loading decoder session (110MB, may take a while)...');
+        const url = WHISPER_RELEASE_BASE + '/decoder_model_merged_quantized.onnx';
+        const sess = await ort.InferenceSession.create(url, { executionProviders: ['wasm'] });
+        log('decoder inputs:', sess.inputNames, 'outputs:', sess.outputNames);
+        return sess;
+      })();
+    }
+    return whisperDecoderPromise;
+  }
+
+  // ---- Mel spectrogram (matches openai/whisper's audio.py parameters) ----
+  function hannWindow(N){
+    const w = new Float32Array(N);
+    for (let i=0;i<N;i++) w[i] = 0.5 - 0.5*Math.cos(2*Math.PI*i/(N-1));
+    return w;
+  }
+  function melFilterbank(nMels, nFft, sr){
+    const nFreqs = Math.floor(nFft/2)+1;
+    const hzToMel = f => 2595*Math.log10(1+f/700);
+    const melToHz = m => 700*(Math.pow(10, m/2595)-1);
+    const melMin = hzToMel(0), melMax = hzToMel(sr/2);
+    const pts = [];
+    for (let i=0;i<nMels+2;i++) pts.push(melToHz(melMin + (melMax-melMin)*i/(nMels+1)));
+    const bin = pts.map(hz => (nFft+1)*hz/sr);
+    const fb = [];
+    for (let m=1; m<=nMels; m++){
+      const row = new Float32Array(nFreqs);
+      const left=bin[m-1], center=bin[m], right=bin[m+1];
+      for (let k=0;k<nFreqs;k++){
+        if (k>=left && k<=center && center>left) row[k] = (k-left)/(center-left);
+        else if (k>center && k<=right && right>center) row[k] = (right-k)/(right-center);
+      }
+      fb.push(row);
+    }
+    return fb;
+  }
+  function computeLogMelSpectrogram(samples16k){
+    let padded = samples16k;
+    if (padded.length < WHISPER_CHUNK_SAMPLES){
+      const p = new Float32Array(WHISPER_CHUNK_SAMPLES);
+      p.set(padded);
+      padded = p;
+    } else if (padded.length > WHISPER_CHUNK_SAMPLES){
+      padded = padded.subarray(0, WHISPER_CHUNK_SAMPLES);
+    }
+    const half = WHISPER_N_FFT >> 1;
+    const reflected = new Float32Array(padded.length + 2*half);
+    reflected.set(padded, half);
+    for (let i=0;i<half;i++){
+      reflected[half-1-i] = padded[Math.min(i+1, padded.length-1)];
+      reflected[half+padded.length+i] = padded[Math.max(padded.length-2-i, 0)];
+    }
+    const window = hannWindow(WHISPER_N_FFT);
+    const fb = melFilterbank(WHISPER_N_MELS, WHISPER_N_FFT, WHISPER_SR);
+    const nFreqs = Math.floor(WHISPER_N_FFT/2)+1;
+    const nFrames = Math.floor((reflected.length - WHISPER_N_FFT)/WHISPER_HOP) + 1;
+    const targetFrames = 3000;
+    const mel = new Float32Array(WHISPER_N_MELS * targetFrames);
+    const frameBuf = new Float32Array(WHISPER_N_FFT);
+    const power = new Float32Array(nFreqs);
+    let maxLog = -Infinity;
+    const framesToUse = Math.min(nFrames, targetFrames);
+    for (let f=0; f<framesToUse; f++){
+      const start = f*WHISPER_HOP;
+      for (let i=0;i<WHISPER_N_FFT;i++) frameBuf[i] = reflected[start+i]*window[i];
+      for (let k=0;k<nFreqs;k++){
+        let re=0, im=0;
+        const w = 2*Math.PI*k/WHISPER_N_FFT;
+        for (let n2=0;n2<WHISPER_N_FFT;n2++){ const a=w*n2; re += frameBuf[n2]*Math.cos(a); im -= frameBuf[n2]*Math.sin(a); }
+        power[k] = re*re+im*im;
+      }
+      for (let m=0;m<WHISPER_N_MELS;m++){
+        const row = fb[m];
+        let sum=0; for (let k=0;k<nFreqs;k++) sum += row[k]*power[k];
+        const logv = Math.log10(Math.max(sum, 1e-10));
+        mel[m*targetFrames+f] = logv;
+        if (logv>maxLog) maxLog = logv;
+      }
+    }
+    for (let i=0;i<mel.length;i++){
+      const clamped = Math.max(mel[i], maxLog-8.0);
+      mel[i] = (clamped+4.0)/4.0;
+    }
+    return mel; // Float32Array length 80*3000, row-major [mel, time]
+  }
+
+  // ---- Greedy autoregressive decode with dynamic KV-cache introspection ----
+  async function decodeChunk(encoderSession, decoderSession, melData, vocabData, maxNewTokens){
+    const inputFeats = new ort.Tensor('float32', melData, [1, WHISPER_N_MELS, 3000]);
+    const encOut = await encoderSession.run({ [encoderSession.inputNames[0]]: inputFeats });
+    const encHidden = encOut[encoderSession.outputNames[0]];
+
+    const decIn = decoderSession.inputNames;
+    const hasUseCacheBranch = decIn.includes('use_cache_branch');
+    const pastNames = decIn.filter(n => n.startsWith('past_key_values.'));
+
+    let pastFeeds = {};
+    for (const name of pastNames){
+      const isEncoderKV = name.includes('.encoder.');
+      // zero-length seq dimension on the first step
+      pastFeeds[name] = new ort.Tensor('float32', new Float32Array(0), [1, WHISPER_N_HEADS, 0, WHISPER_HEAD_DIM]);
+    }
+
+    let tokens = [vocabData.bosId, vocabData.arId, vocabData.transcribeId];
+    let generated = [];
+    let inputIds = tokens.slice();
+
+    for (let step=0; step<maxNewTokens; step++){
+      const idsTensor = new ort.Tensor('int64', BigInt64Array.from(inputIds.map(BigInt)), [1, inputIds.length]);
+      const feeds = { [decIn.find(n=>n==='input_ids') || 'input_ids']: idsTensor };
+      const encHiddenName = decIn.find(n => n.includes('encoder_hidden_states'));
+      if (encHiddenName) feeds[encHiddenName] = encHidden;
+      if (hasUseCacheBranch) feeds['use_cache_branch'] = new ort.Tensor('bool', Uint8Array.from([step>0 ? 1 : 0]), [1]);
+      Object.assign(feeds, pastFeeds);
+
+      const out = await decoderSession.run(feeds);
+      const logitsName = decoderSession.outputNames.find(n => n.includes('logits')) || decoderSession.outputNames[0];
+      const logits = out[logitsName];
+      const vocabSize = logits.dims[logits.dims.length-1];
+      const seqLen = logits.dims[logits.dims.length-2];
+      const lastStart = (seqLen-1) * vocabSize;
+      let bestId=0, bestVal=-Infinity;
+      for (let v=0; v<vocabSize; v++){
+        const val = logits.data[lastStart+v];
+        if (val>bestVal){ bestVal=val; bestId=v; }
+      }
+
+      // carry forward the new present.* as next step's past_key_values.*
+      const newPast = {};
+      for (const outName of decoderSession.outputNames){
+        if (!outName.startsWith('present.')) continue;
+        const pastName = outName.replace(/^present\./, 'past_key_values.');
+        if (pastNames.includes(pastName)) newPast[pastName] = out[outName];
+      }
+      pastFeeds = Object.assign({}, pastFeeds, newPast);
+
+      if (bestId === vocabData.eotId) break;
+      generated.push(bestId);
+      inputIds = [bestId];
+      if (generated.length===1) log('first generated token id:', bestId, vocabData.id2tok[bestId]);
+    }
+    return generated;
+  }
+
+  function parseTimestampedSegments(tokenIds, vocabData, chunkOffset){
+    const segments = [];
+    let curStart = null, curTextIds = [];
+    for (const id of tokenIds){
+      if (vocabData.timestampIdToTime.hasOwnProperty(id)){
+        const t = vocabData.timestampIdToTime[id];
+        if (curStart === null){
+          curStart = t;
+        } else {
+          const text = decodeTokenIds(curTextIds, vocabData).trim();
+          if (text) segments.push({ text, tStart: chunkOffset+curStart, tEnd: chunkOffset+t });
+          curStart = t; curTextIds = [];
+        }
+      } else {
+        curTextIds.push(id);
+      }
+    }
+    if (curTextIds.length && curStart !== null){
+      const text = decodeTokenIds(curTextIds, vocabData).trim();
+      if (text) segments.push({ text, tStart: chunkOffset+curStart, tEnd: chunkOffset+Math.min(30,curStart+5) });
+    }
+    return segments;
+  }
+
+  async function transcribeAudio(audioBuffer, onProgress){
+    const vocabData = await loadWhisperVocab();
+    const [encoderSession, decoderSession] = await Promise.all([getEncoderSession(), getDecoderSession()]);
+    const data16k = await resampleBufferTo16k(audioBuffer);
+    const totalChunks = Math.max(1, Math.ceil(data16k.length / WHISPER_CHUNK_SAMPLES));
+    const allSegments = [];
+    for (let c=0; c<totalChunks; c++){
+      const start = c*WHISPER_CHUNK_SAMPLES;
+      const chunkSamples = data16k.subarray(start, start+WHISPER_CHUNK_SAMPLES);
+      const mel = computeLogMelSpectrogram(chunkSamples);
+      const tokenIds = await decodeChunk(encoderSession, decoderSession, mel, vocabData, 224);
+      const segs = parseTimestampedSegments(tokenIds, vocabData, c*30);
+      allSegments.push(...segs);
+      if (onProgress) onProgress(Math.round(((c+1)/totalChunks)*100));
+    }
+    return allSegments;
+  }
+
+  if (transcribeBtn){
+    transcribeBtn.addEventListener('click', async () => {
+      if (!referenceAudioBuffer) return;
+      transcribeBtn.disabled = true;
+      const originalText = transcribeBtn.textContent;
+      try{
+        statusEl.textContent = 'جارٍ تحميل نموذج التعرّف على الكلام (أول مرة فقط، قد يستغرق دقيقة)...';
+        transcribeBtn.textContent = 'جارٍ التفريغ... 0%';
+        const segs = await transcribeAudio(referenceAudioBuffer, (pct) => {
+          transcribeBtn.textContent = `جارٍ التفريغ... ${pct}%`;
+          statusEl.textContent = `جارٍ التعرّف على النص... ${pct}%`;
+        });
+        whisperSegments = segs;
+        verseTextarea.value = segs.map(s=>s.text).join(' ').trim();
+        computeWordAlignment();
+        statusEl.textContent = segs.length ? 'تم التعرّف على النص' : 'لم يُتعرّف على نص واضح في هذا المقطع';
+      }catch(err){
+        console.error('[Whisper] transcription failed:', err);
+        statusEl.textContent = 'تعذّر التعرّف على النص — افتح الكونسول لمعرفة السبب بالتفصيل';
+      }finally{
+        transcribeBtn.disabled = false;
+        transcribeBtn.textContent = originalText;
+      }
+    });
+  }
 
   render();
 })();
