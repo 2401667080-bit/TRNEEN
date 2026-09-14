@@ -824,11 +824,10 @@
   // verifiable without a live browser), and everything is logged to the
   // console with a "[Whisper]" prefix for debugging.
   //
-  // SETUP REQUIRED (see chat instructions): edit WHISPER_RELEASE_BASE
-  // below to your GitHub Release download URL, and host the small files
-  // (ort.min.js, vocab.json, added_tokens.json) under ./whisper-model/.
-  // ==================================================================
-  const WHISPER_RELEASE_BASE = 'https://github.com/2401667080-bit/TRNEEN/releases/download/v1';
+  // SETUP REQUIRED (see chat instructions): host all files listed below
+  // under ./whisper-model/ in the repo (same-origin — avoids CORS issues
+  // entirely, unlike GitHub Releases which don't support programmatic
+  // fetch()/import() of their assets).
   const WHISPER_LOCAL_BASE = './whisper-model/';
   const WHISPER_N_MELS = 80, WHISPER_N_FFT = 400, WHISPER_HOP = 160, WHISPER_SR = 16000;
   const WHISPER_CHUNK_SAMPLES = 30 * WHISPER_SR; // 30s fixed chunk
@@ -911,7 +910,7 @@
 
   async function ensureOrt(){
     if (typeof ort === 'undefined') throw new Error('مكتبة onnxruntime-web (ort.min.js) لم تُحمَّل — تأكد من إضافتها في index.html');
-    ort.env.wasm.wasmPaths = WHISPER_RELEASE_BASE + '/';
+    ort.env.wasm.wasmPaths = WHISPER_LOCAL_BASE;
     ort.env.wasm.numThreads = 1; // avoid requiring cross-origin-isolation headers
   }
   async function getEncoderSession(){
@@ -919,7 +918,7 @@
       whisperEncoderPromise = (async () => {
         await ensureOrt();
         log('loading encoder session...');
-        const url = WHISPER_RELEASE_BASE + '/encoder_model_quantized.onnx';
+        const url = WHISPER_LOCAL_BASE + 'onnx/encoder_model_fp16.onnx';
         const sess = await ort.InferenceSession.create(url, { executionProviders: ['wasm'] });
         log('encoder inputs:', sess.inputNames, 'outputs:', sess.outputNames);
         return sess;
@@ -931,8 +930,8 @@
     if (!whisperDecoderPromise){
       whisperDecoderPromise = (async () => {
         await ensureOrt();
-        log('loading decoder session (110MB, may take a while)...');
-        const url = WHISPER_RELEASE_BASE + '/decoder_model_merged_quantized.onnx';
+        log('loading decoder session (~60MB, may take a while)...');
+        const url = WHISPER_LOCAL_BASE + 'onnx/decoder_model_merged_fp16.onnx';
         const sess = await ort.InferenceSession.create(url, { executionProviders: ['wasm'] });
         log('decoder inputs:', sess.inputNames, 'outputs:', sess.outputNames);
         return sess;
