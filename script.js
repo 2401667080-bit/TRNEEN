@@ -924,7 +924,7 @@
       whisperEncoderPromise = (async () => {
         await ensureOrt();
         log('loading encoder session...');
-        const url = WHISPER_LOCAL_BASE + 'onnx/encoder_model_fp16.onnx';
+        const url = WHISPER_LOCAL_BASE + 'onnx/encoder_model_q4.onnx';
         const sess = await ort.InferenceSession.create(url, { executionProviders: ['wasm'] });
         log('encoder inputs:', sess.inputNames, 'outputs:', sess.outputNames);
         return sess;
@@ -937,7 +937,7 @@
       whisperDecoderPromise = (async () => {
         await ensureOrt();
         log('loading decoder session (first-step, no cache)...');
-        const url = WHISPER_LOCAL_BASE + 'onnx/decoder_model_fp16.onnx';
+        const url = WHISPER_LOCAL_BASE + 'onnx/decoder_model_q4.onnx';
         const sess = await ort.InferenceSession.create(url, { executionProviders: ['wasm'] });
         log('decoder inputs:', sess.inputNames, 'outputs:', sess.outputNames);
         return sess;
@@ -950,7 +950,7 @@
       whisperDecoderWithPastPromise = (async () => {
         await ensureOrt();
         log('loading decoder-with-past session (subsequent steps)...');
-        const url = WHISPER_LOCAL_BASE + 'onnx/decoder_with_past_model_fp16.onnx';
+        const url = WHISPER_LOCAL_BASE + 'onnx/decoder_with_past_model_q4.onnx';
         const sess = await ort.InferenceSession.create(url, { executionProviders: ['wasm'] });
         log('decoder-with-past inputs:', sess.inputNames, 'outputs:', sess.outputNames);
         return sess;
