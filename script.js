@@ -837,6 +837,7 @@
   let whisperVocabPromise = null;
   let whisperEncoderPromise = null;
   let whisperDecoderPromise = null;
+  let whisperDecoderWithPastPromise = null;
 
   function log(...args){ console.log('[Whisper]', ...args); }
 
@@ -935,14 +936,27 @@
     if (!whisperDecoderPromise){
       whisperDecoderPromise = (async () => {
         await ensureOrt();
-        log('loading decoder session (~60MB, may take a while)...');
-        const url = WHISPER_LOCAL_BASE + 'onnx/decoder_model_merged_fp16.onnx';
+        log('loading decoder session (first-step, no cache)...');
+        const url = WHISPER_LOCAL_BASE + 'onnx/decoder_model_fp16.onnx';
         const sess = await ort.InferenceSession.create(url, { executionProviders: ['wasm'] });
         log('decoder inputs:', sess.inputNames, 'outputs:', sess.outputNames);
         return sess;
       })();
     }
     return whisperDecoderPromise;
+  }
+  async function getDecoderWithPastSession(){
+    if (!whisperDecoderWithPastPromise){
+      whisperDecoderWithPastPromise = (async () => {
+        await ensureOrt();
+        log('loading decoder-with-past session (subsequent steps)...');
+        const url = WHISPER_LOCAL_BASE + 'onnx/decoder_with_past_model_fp16.onnx';
+        const sess = await ort.InferenceSession.create(url, { executionProviders: ['wasm'] });
+        log('decoder-with-past inputs:', sess.inputNames, 'outputs:', sess.outputNames);
+        return sess;
+      })();
+    }
+    return whisperDecoderWithPastPromise;
   }
 
   // ---- Mel spectrogram (matches openai/whisper's audio.py parameters) ----
@@ -1021,60 +1035,72 @@
     return mel; // Float32Array length 80*3000, row-major [mel, time]
   }
 
-  // ---- Greedy autoregressive decode with dynamic KV-cache introspection ----
-  async function decodeChunk(encoderSession, decoderSession, melData, vocabData, maxNewTokens){
+  function argmaxLastPosition(logits){
+    const vocabSize = logits.dims[logits.dims.length-1];
+    const seqLen = logits.dims[logits.dims.length-2];
+    const lastStart = (seqLen-1) * vocabSize;
+    let bestId=0, bestVal=-Infinity;
+    for (let v=0; v<vocabSize; v++){
+      const val = logits.data[lastStart+v];
+      if (val>bestVal){ bestVal=val; bestId=v; }
+    }
+    return bestId;
+  }
+
+  // ---- Greedy autoregressive decode using two plain (non-merged) sessions ----
+  async function decodeChunk(encoderSession, decoderSession, decoderWithPastSession, melData, vocabData, maxNewTokens){
     const inputFeats = new ort.Tensor('float32', melData, [1, WHISPER_N_MELS, 3000]);
     const encOut = await encoderSession.run({ [encoderSession.inputNames[0]]: inputFeats });
     const encHidden = encOut[encoderSession.outputNames[0]];
 
-    const decIn = decoderSession.inputNames;
-    const hasUseCacheBranch = decIn.includes('use_cache_branch');
-    const pastNames = decIn.filter(n => n.startsWith('past_key_values.'));
+    const generated = [];
 
+    // Step 0: no-cache decoder consumes the full initial prompt at once.
+    const initTokens = [vocabData.bosId, vocabData.arId, vocabData.transcribeId];
+    const decIn0 = decoderSession.inputNames;
+    const idsTensor0 = new ort.Tensor('int64', BigInt64Array.from(initTokens.map(BigInt)), [1, initTokens.length]);
+    const feeds0 = { [decIn0.find(n=>n==='input_ids') || 'input_ids']: idsTensor0 };
+    const encHiddenName0 = decIn0.find(n => n.includes('encoder_hidden_states'));
+    if (encHiddenName0) feeds0[encHiddenName0] = encHidden;
+
+    let out = await decoderSession.run(feeds0);
+    const logitsName0 = decoderSession.outputNames.find(n => n.includes('logits')) || decoderSession.outputNames[0];
+    let bestId = argmaxLastPosition(out[logitsName0]);
+    log('first generated token id:', bestId, vocabData.id2tok[bestId]);
+
+    // Seed the KV cache from step 0's outputs for the with-past session.
     let pastFeeds = {};
-    for (const name of pastNames){
-      const isEncoderKV = name.includes('.encoder.');
-      // zero-length seq dimension on the first step
-      pastFeeds[name] = new ort.Tensor('float32', new Float32Array(0), [1, WHISPER_N_HEADS, 0, WHISPER_HEAD_DIM]);
+    for (const outName of decoderSession.outputNames){
+      if (!outName.startsWith('present.')) continue;
+      pastFeeds[outName.replace(/^present\./, 'past_key_values.')] = out[outName];
     }
 
-    let tokens = [vocabData.bosId, vocabData.arId, vocabData.transcribeId];
-    let generated = [];
-    let inputIds = tokens.slice();
+    if (bestId !== vocabData.eotId) generated.push(bestId);
 
-    for (let step=0; step<maxNewTokens; step++){
-      const idsTensor = new ort.Tensor('int64', BigInt64Array.from(inputIds.map(BigInt)), [1, inputIds.length]);
-      const feeds = { [decIn.find(n=>n==='input_ids') || 'input_ids']: idsTensor };
-      const encHiddenName = decIn.find(n => n.includes('encoder_hidden_states'));
-      if (encHiddenName) feeds[encHiddenName] = encHidden;
-      if (hasUseCacheBranch) feeds['use_cache_branch'] = new ort.Tensor('bool', Uint8Array.from([step>0 ? 1 : 0]), [1]);
-      Object.assign(feeds, pastFeeds);
+    const decInP = decoderWithPastSession.inputNames;
+    const pastNamesP = decInP.filter(n => n.startsWith('past_key_values.'));
+    const encHiddenNameP = decInP.find(n => n.includes('encoder_hidden_states'));
 
-      const out = await decoderSession.run(feeds);
-      const logitsName = decoderSession.outputNames.find(n => n.includes('logits')) || decoderSession.outputNames[0];
-      const logits = out[logitsName];
-      const vocabSize = logits.dims[logits.dims.length-1];
-      const seqLen = logits.dims[logits.dims.length-2];
-      const lastStart = (seqLen-1) * vocabSize;
-      let bestId=0, bestVal=-Infinity;
-      for (let v=0; v<vocabSize; v++){
-        const val = logits.data[lastStart+v];
-        if (val>bestVal){ bestVal=val; bestId=v; }
-      }
+    for (let step=1; step<maxNewTokens && bestId!==vocabData.eotId; step++){
+      const idsTensor = new ort.Tensor('int64', BigInt64Array.from([BigInt(bestId)]), [1,1]);
+      const feeds = { [decInP.find(n=>n==='input_ids') || 'input_ids']: idsTensor };
+      if (encHiddenNameP) feeds[encHiddenNameP] = encHidden;
+      for (const pn of pastNamesP) if (pastFeeds[pn]) feeds[pn] = pastFeeds[pn];
 
-      // carry forward the new present.* as next step's past_key_values.*
+      out = await decoderWithPastSession.run(feeds);
+      const logitsNameP = decoderWithPastSession.outputNames.find(n => n.includes('logits')) || decoderWithPastSession.outputNames[0];
+      bestId = argmaxLastPosition(out[logitsNameP]);
+
       const newPast = {};
-      for (const outName of decoderSession.outputNames){
+      for (const outName of decoderWithPastSession.outputNames){
         if (!outName.startsWith('present.')) continue;
         const pastName = outName.replace(/^present\./, 'past_key_values.');
-        if (pastNames.includes(pastName)) newPast[pastName] = out[outName];
+        if (pastNamesP.includes(pastName)) newPast[pastName] = out[outName];
       }
       pastFeeds = Object.assign({}, pastFeeds, newPast);
 
       if (bestId === vocabData.eotId) break;
       generated.push(bestId);
-      inputIds = [bestId];
-      if (generated.length===1) log('first generated token id:', bestId, vocabData.id2tok[bestId]);
     }
     return generated;
   }
@@ -1105,7 +1131,9 @@
 
   async function transcribeAudio(audioBuffer, onProgress){
     const vocabData = await loadWhisperVocab();
-    const [encoderSession, decoderSession] = await Promise.all([getEncoderSession(), getDecoderSession()]);
+    const [encoderSession, decoderSession, decoderWithPastSession] = await Promise.all([
+      getEncoderSession(), getDecoderSession(), getDecoderWithPastSession()
+    ]);
     const data16k = await resampleBufferTo16k(audioBuffer);
     const totalChunks = Math.max(1, Math.ceil(data16k.length / WHISPER_CHUNK_SAMPLES));
     const allSegments = [];
@@ -1113,7 +1141,7 @@
       const start = c*WHISPER_CHUNK_SAMPLES;
       const chunkSamples = data16k.subarray(start, start+WHISPER_CHUNK_SAMPLES);
       const mel = computeLogMelSpectrogram(chunkSamples);
-      const tokenIds = await decodeChunk(encoderSession, decoderSession, mel, vocabData, 224);
+      const tokenIds = await decodeChunk(encoderSession, decoderSession, decoderWithPastSession, mel, vocabData, 224);
       const segs = parseTimestampedSegments(tokenIds, vocabData, c*30);
       allSegments.push(...segs);
       if (onProgress) onProgress(Math.round(((c+1)/totalChunks)*100));
